@@ -4,7 +4,7 @@ I've chosen the parquet dataset format because:
 - it's Apache Hadoop ecosystem data format, so it optimized for work with Spark and takes up less disk space
 ## Build and Run
 
-Clone project on your local via Intellij IDEA
+Clone project on your local via Intellij IDEA.
 Run [Main.scala](src/main/scala/Main.scala)
 ## Results
 Result of the first task:
