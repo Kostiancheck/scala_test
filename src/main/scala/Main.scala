@@ -1,12 +1,13 @@
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions._
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.functions.{dayofmonth, desc, from_unixtime, month, year}
 
 object Main {
 
   val spark: SparkSession = SparkSession
     .builder()
     .master("local")
-    .appName("Spark SQL basic example")
+    .appName("Ocean Test Task Session")
     .getOrCreate()
   spark.sparkContext.setLogLevel("ERROR") // turn off INFO and WARN logs
 
@@ -16,14 +17,37 @@ object Main {
     val filePath = "./src/main/parquet_data/*"
     val oceanDF = spark.read.parquet(filePath).cache()
 
+    // 3.What is(are) the main time period(s) in the data?
     findMainTimePeriod(oceanDF)
-    //findSparseVars(oceanDF)
+
+    // 4. Which are the top three most sparse variables?
+    //    findSparseVars(oceanDF)
+
+    // 5. What region(s) of the world and ocean port(s) does this data represent?
+    findMainValue(oceanDF, "port.name")
+    findMainValue(oceanDF, "olson_timezone")
+
+    // 6. Provide a frequency tabulation of the various Navigation Codes & Descriptions (i.e., navCode & NavDesc).
+    // Optionally, provide any additional statistics you find interesting.
+    getFrequency(oceanDF, "navigation.navDesc")
+    getFrequency(oceanDF, "destination")
+    getFrequency(oceanDF, "vesselDetails.typeName")
+    findFrequencyByIntervals(oceanDF, "vesselDetails.length", 10)
+    // 7. For MMSI = 205792000, provide the following report:
+    //    - mmsi = the MMSI of the vessel
+    //    - timestamp = the timestamp of the last event in that contiguous series
+    //    - Navigation Code = the navigation code (i.e., navigation.navCode)
+    //    - Navigation Description = the navigation code description (i.e., navigation.navDesc)
+    //    - lead time (in Milliseconds) = the time difference in milliseconds between the last and
+    //    first timestamp of that particular
+    //    - series of the same contiguous navigation codes
+    //createReport(oceanDF, 205792000, "navigation.navCode", 5) // doesn't work
   }
 
-  /** Finds time period with the biggest number of entries (main time period)
+  /** Finds time period with the biggest number of entries (the main time period)
    *
-   * Gets dataframe with dwells entries, groups entries by day,
-   * finds and prints out number of entries per each day.
+   * Gets dataframe with dwells entries, adds column with date from epochMillis column,
+   * groups entries by day, finds and prints out number of entries per each day.
    * From all days finds the main (with the biggest number of entries)
    *
    * @param df the DataFrame with dwells info
@@ -31,6 +55,7 @@ object Main {
   def findMainTimePeriod(df: DataFrame): Unit = {
     val dfWithDate = df.withColumn("dateTime", from_unixtime($"epochMillis" / 1000))
 
+    // TODO use window($"dateTime", "1 day") instead of group by year, month, and day
     val numberPerDay = dfWithDate.groupBy(year(dfWithDate("dateTime")).alias("year"),
       month(dfWithDate("dateTime")).alias("month"),
       dayofmonth(dfWithDate("dateTime")).alias("day"))
@@ -41,22 +66,20 @@ object Main {
     numberPerDay.show(false)
 
     val mainDate = numberPerDay.first()
-    print(s"The day with the biggest number of entries (the main time period) is " +
+    println(s"The day with the biggest number of entries (the main time period) is " +
       s"${mainDate.getAs("year")}-${mainDate.getAs("month")}-${mainDate.getAs("day")} " +
       s"(YYYY-MM-DD) with ${mainDate.getAs("count")} entries")
   }
 
   /** Unfinished function that finds top most sparse variables
    *
-   * Gets dataframe with dwells entries, groups entries by day,
-   * finds and prints out number of entries per each day.
-   * From all days finds the main (with the biggest number of entries)
-   *
-   * @param df the DataFrame with dwells info
+   * @param df  the DataFrame with dwells info
    * @param top the Integer number of top values that users need (3 by default)
    */
   def findSparseVars(df: DataFrame, top: Int = 3): Unit = {
+    df.printSchema()
     val dfCountPerColumn = df.describe().filter($"summary" === "count")
+    dfCountPerColumn.printSchema()
     println("Number of non-null values in each column")
     dfCountPerColumn.show(false)
     // TODO
@@ -64,6 +87,132 @@ object Main {
     // 2. order by count
     // 3. take first 3 (by default) values
     // 4.(optional) if two of the first three rows have the same value, then take the fourth, fifth etc.
-    // until there are 3 different values
+    // until there are 3 different values. Use window function dense_rank() for this
   }
+
+  /** Finds main value of the column
+   *
+   * Gets dataframe with dwells entries and counts number of entries for each group.
+   * Prints out the main group (group with the biggest number of entries)
+   *
+   * @param df         the DataFrame with dwells info
+   * @param columnName the String column name to find main value
+   */
+  def findMainValue(df: DataFrame, columnName: String): Unit = {
+    val portsDF = getFrequency(df, columnName)
+    val mainRow = portsDF.first()
+    println(s"The main $columnName is ${mainRow.get(0)}. " +
+      s"There are ${mainRow.getAs("count")} entries from there.")
+  }
+
+  /** Gets frequency DataFrame (tabulation) of column
+   *
+   * Gets dataframe with dwells entries, groups by column, and counts number
+   * of entries for each group in this column
+   *
+   * @param df         the DataFrame with dwells info
+   * @param columnName the String column name to find main value
+   * @return DataFrame with values and number of entries for each value
+   */
+  def getFrequency(df: DataFrame, columnName: String): DataFrame = {
+    val frequencyDF = df.groupBy(columnName).count().orderBy(desc("count"))
+    println(s"\nFrequency for each $columnName:")
+    frequencyDF.show(truncate = false)
+    frequencyDF
+  }
+
+  /** Finds interval frequency DataFrame (tabulation) of column
+   *
+   * Cleans df(columnName) from null and zero values, in for-loop counts the intervals (based on min and max values in
+   * df(columnName) and numberOfIntervals) and finds the number of entries, that included in every interval.
+   * Number of entries for the last interval count separately (outside the loop), because it is closed interval, but
+   * not half-opened as previous. Checks if all values from df were distributed into intervals (sum of values before
+   * distribution must be equal to the sum after) and prints out interval frequency tabulation
+   *
+   * @param df                the DataFrame with dwells info
+   * @param columnName        the String column name to find main value
+   * @param numberOfIntervals the Integer number of intervals
+   * @return DataFrame with values and number of entries
+   */
+  def findFrequencyByIntervals(df: DataFrame, columnName: String, numberOfIntervals: Int): Unit = {
+    val dfWithoutNull = df.filter(df(columnName).isNotNull)
+      .filter(df(columnName) =!= 0)
+      .groupBy(columnName)
+      .count()
+
+    val nestedColumnName = columnName.split("\\.").last
+    val minLength = dfWithoutNull.agg(min(dfWithoutNull(nestedColumnName))).first().get(0).asInstanceOf[Long]
+    val maxLength = dfWithoutNull.agg(max(dfWithoutNull(nestedColumnName))).first().get(0).asInstanceOf[Long]
+    val interval = (maxLength - minLength) / numberOfIntervals.asInstanceOf[Float]
+
+    var frequencyDF: DataFrame = null
+    for (interval_index <- 1 until numberOfIntervals) {
+      val intervalStartPoint = minLength + interval * (interval_index - 1)
+      val intervalEndPoint = intervalStartPoint + interval
+      // add number of entries in half-opened intervals
+      val entriesInInterval = dfWithoutNull
+        .filter(dfWithoutNull(nestedColumnName) >= intervalStartPoint)
+        .filter(dfWithoutNull(nestedColumnName) < intervalEndPoint)
+        .agg(sum("count").alias("Count of values that are included in the interval"))
+        .withColumn("Interval", lit("[" + intervalStartPoint + "; " + intervalEndPoint + ")"))
+      interval_index match {
+        case 1 => frequencyDF = entriesInInterval
+        case _ => frequencyDF = frequencyDF.unionAll(entriesInInterval)
+      }
+    }
+
+    val lastIntervalStartPoint = minLength + interval * (numberOfIntervals - 1)
+    val lastIntervalEndPoint = maxLength // == lastIntervalStartPoint + interval
+    // add number of entries in last closed interval
+    val entriesInLastInterval = dfWithoutNull
+      .filter(dfWithoutNull(nestedColumnName) >= lastIntervalStartPoint)
+      .filter(dfWithoutNull(nestedColumnName) <= lastIntervalEndPoint)
+      .agg(sum("count").alias("Count of values that are included in the interval"))
+      .withColumn("Interval", lit("[" + lastIntervalStartPoint + "; " + lastIntervalEndPoint + "]"))
+    frequencyDF = frequencyDF.unionAll(entriesInLastInterval)
+
+    // Check
+    // Sum of entries before division into intervals
+    val initialEntriesSumS = dfWithoutNull
+      .agg(sum("count"))
+      .first()
+      .get(0)
+    // after division into intervals
+    val entriesSum = frequencyDF
+      .agg(sum("Count of values that are included in the interval"))
+      .first()
+      .get(0)
+    assert(initialEntriesSumS == entriesSum)
+
+
+    println(s"Frequency tabulation of $columnName:")
+    frequencyDF.show(false)
+  }
+
+  /** Unfinished function that provides report about series of continuous events
+   *
+   * Finds series of continuous events in df(columnName) (series where column value does not change), provides
+   * info about duration of the series and final state
+   *
+   * @param df   the DataFrame with dwells info
+   * @param mmsi Maritime Mobile Service Identity number
+   * @return DataFrame with values and number of entries for each value
+   */
+  def createReport(df: DataFrame, mmsi: Long, columnName: String, top: Int): Unit = {
+    val nestedColumnName = columnName.split("\\.").last
+    val topNavCodes = getFrequency(df, columnName).select(nestedColumnName).head(top)
+    val timeWindow = Window.partitionBy(columnName).orderBy("epochMillis")
+    //    val mmsiDFWithLead = df
+    //      .filter($"mmsi" === mmsi)
+    //      .filter($"navigation.navCode" isin topNavCodes)
+    //      .withColumn("lead time", col("navigation.navCode") - first("navigation.navCode").over(timeWindow))
+    //      .withColumn("lead", lead("navigation.navCode", 1).over(timeWindow))
+    // TODO
+    // 1. find end of series using lead("navigation.navCode", 1).over(timeWindow) function: comparing current
+    // navCode and navCode of in the next row
+    // 2. in some way group every series and count time difference between the last and first timestamp of the particular
+    //  series. Use col("navigation.navCode") - first("navigation.navCode").over(timeWindow)) for this
+
+  }
+
 }
