@@ -1,6 +1,9 @@
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.types.{DataType, StructType}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+
+import scala.collection.mutable.ListBuffer
 
 object Main {
 
@@ -14,19 +17,23 @@ object Main {
   import spark.implicits._
 
   def main(args: Array[String]): Unit = {
+    //    val filePath = "./src/main/parquet_data/part-00000-91b4ffd0-5234-4ade-9b7f-a8a66789a0a7-c000.snappy.parquet"
     val filePath = "./src/main/parquet_data/*"
+
     val oceanDF = spark.read.parquet(filePath).cache()
 
     // 3.What is(are) the main time period(s) in the data?
     findMainTimePeriod(oceanDF)
+    //
+    //4. Which are the top three most sparse variables?
+    findSparseVars(oceanDF)
+    findSparseVars(oceanDF, 8)
 
-    // 4. Which are the top three most sparse variables?
-    //    findSparseVars(oceanDF)
-
+    //
     // 5. What region(s) of the world and ocean port(s) does this data represent?
     findMainValue(oceanDF, "port.name")
     findMainValue(oceanDF, "olson_timezone")
-
+    //
     // 6. Provide a frequency tabulation of the various Navigation Codes & Descriptions (i.e., navCode & NavDesc).
     // Optionally, provide any additional statistics you find interesting.
     getFrequency(oceanDF, "navigation.navDesc")
@@ -41,7 +48,20 @@ object Main {
     //    - lead time (in Milliseconds) = the time difference in milliseconds between the last and
     //    first timestamp of that particular
     //    - series of the same contiguous navigation codes
-    //createReport(oceanDF, 205792000, "navigation.navCode", 5) // doesn't work
+    val report = createReport(oceanDF, 205792000, "navigation.navCode",
+      "navigation.navDesc", 5)
+    println("Series of continuous events with the same Navigation Code:")
+    report.show(false)
+    // 8.For MMSI = 413970021, provide the same report as number 7
+    //    Do you agree with the Navigation Code(s) and Description(s) for this particular vessel?
+    //    - If you do agree, provide an explanation why you agree.
+    //    - If you do not agree, provide an explanation why do disagree. Additionally, if you do not agree, what would you change it
+    //    to and why?
+    val secondReport = createReport(oceanDF, 413970021, "navigation.navCode",
+      "navigation.navDesc", 5)
+    println("Series of continuous events with the same Navigation Code:")
+    secondReport.show(false)
+
   }
 
   /** Finds time period with the biggest number of entries (the main time period)
@@ -71,24 +91,51 @@ object Main {
       s"(YYYY-MM-DD) with ${mainDate.getAs("count")} entries")
   }
 
-  /** Unfinished function that finds top most sparse variables
+
+  /** Returns the list of column names of the data frame
+   *
+   * @param dt            data frame schema
+   * @param path          name of the column/nested column
+   * @param listOfColumns temp list of column names
+   * @return ListBuffer[String] list of column names
+   */
+  def getColumns(dt: DataType, path: String = "",
+                 listOfColumns: ListBuffer[String] = ListBuffer[String]()): ListBuffer[String] = {
+    dt match {
+      case s: StructType =>
+        s.fields.foreach(f => getColumns(f.dataType, path + "." + f.name, listOfColumns))
+      case _ =>
+        listOfColumns += path
+    }
+    listOfColumns.map(columnName => columnName.substring(1)) // delete '.' from the begin of the column name
+  }
+
+  /** Finds top most sparse variables
+   *
+   * From df gets a list of all columns, counts the number of non-null values in each column, and
+   * prints out the top most sparse variables (columns with the least number of non-null values)
    *
    * @param df  the DataFrame with dwells info
    * @param top the Integer number of top values that users need (3 by default)
    */
   def findSparseVars(df: DataFrame, top: Int = 3): Unit = {
-    df.printSchema()
-    val dfCountPerColumn = df.describe().filter($"summary" === "count")
-    dfCountPerColumn.printSchema()
-    println("Number of non-null values in each column")
-    dfCountPerColumn.show(false)
-    // TODO
-    // 1. transpose dfCountPerColumn
-    // 2. order by count
-    // 3. take first 3 (by default) values
-    // 4.(optional) if two of the first three rows have the same value, then take the fourth, fifth etc.
-    // until there are 3 different values. Use window function dense_rank() for this
+
+    var countOfVarsDF: DataFrame = Seq.empty[(String, Long)]
+      .toDF("column", "NotNullCount")
+    val columnsList = getColumns(df.schema)
+    for (columnName <- columnsList) {
+      val b = df
+        .filter(df(columnName).isNotNull)
+        .select(lit(columnName).alias("column"), count(columnName).alias("NotNullCount"))
+      countOfVarsDF = countOfVarsDF.unionAll(b)
+    }
+    countOfVarsDF = countOfVarsDF.orderBy("NotNullCount")
+    countOfVarsDF.show(false)
+    countOfVarsDF = countOfVarsDF.withColumn("rank", rank().over(Window.orderBy("NotNullCount")))
+    println(s"TOP $top sparse variables:")
+    countOfVarsDF.filter($"rank" <= top).show(false)
   }
+
 
   /** Finds main value of the column
    *
@@ -105,7 +152,7 @@ object Main {
       s"There are ${mainRow.getAs("count")} entries from there.")
   }
 
-  /** Gets frequency DataFrame (tabulation) of column
+  /** Returns frequency DataFrame (tabulation) of column
    *
    * Gets dataframe with dwells entries, groups by column, and counts number
    * of entries for each group in this column
@@ -117,7 +164,7 @@ object Main {
   def getFrequency(df: DataFrame, columnName: String): DataFrame = {
     val frequencyDF = df.groupBy(columnName).count().orderBy(desc("count"))
     println(s"\nFrequency for each $columnName:")
-    frequencyDF.show(truncate = false)
+    frequencyDF.show(10, truncate = false)
     frequencyDF
   }
 
@@ -177,11 +224,12 @@ object Main {
       .agg(sum("count"))
       .first()
       .get(0)
-    // after division into intervals
+    // and after division into intervals
     val entriesSum = frequencyDF
       .agg(sum("Count of values that are included in the interval"))
       .first()
       .get(0)
+    // should be the same
     assert(initialEntriesSumS == entriesSum)
 
 
@@ -194,25 +242,70 @@ object Main {
    * Finds series of continuous events in df(columnName) (series where column value does not change), provides
    * info about duration of the series and final state
    *
-   * @param df   the DataFrame with dwells info
-   * @param mmsi Maritime Mobile Service Identity number
-   * @return DataFrame with values and number of entries for each value
+   * @param df                   the DataFrame with dwells info
+   * @param mmsi                 Maritime Mobile Service Identity number
+   * @param columnName           the column for series searching
+   * @param additionalColumnName column with additional information that must be added to the final answer
+   * @param top                  the number of top elements by which the data will be filtered
+   * @return DataFrame with series of continuous events with the same values in the df(columnName):
    */
-  def createReport(df: DataFrame, mmsi: Long, columnName: String, top: Int): Unit = {
+  def createReport(df: DataFrame, mmsi: Long, columnName: String, additionalColumnName: String, top: Int): DataFrame = {
     val nestedColumnName = columnName.split("\\.").last
-    val topNavCodes = getFrequency(df, columnName).select(nestedColumnName).head(top)
-    val timeWindow = Window.partitionBy(columnName).orderBy("epochMillis")
-    //    val mmsiDFWithLead = df
-    //      .filter($"mmsi" === mmsi)
-    //      .filter($"navigation.navCode" isin topNavCodes)
-    //      .withColumn("lead time", col("navigation.navCode") - first("navigation.navCode").over(timeWindow))
-    //      .withColumn("lead", lead("navigation.navCode", 1).over(timeWindow))
-    // TODO
-    // 1. find end of series using lead("navigation.navCode", 1).over(timeWindow) function: comparing current
-    // navCode and navCode of in the next row
-    // 2. in some way group every series and count time difference between the last and first timestamp of the particular
-    //  series. Use col("navigation.navCode") - first("navigation.navCode").over(timeWindow)) for this
+    val topNavCodes = getFrequency(df, columnName).select(nestedColumnName).collect().map(_ (0)).toList.take(top)
+    val mmsiDF = df
+      .filter($"mmsi" === mmsi)
+      .filter(df(columnName).isin(topNavCodes: _*))
+      .orderBy("epochMillis")
+      .withColumn("nestedColumn", df(columnName))
+      .withColumn("nestedAdditionalColumn", df(additionalColumnName))
 
+    //    println(s"Entries with mmsi=$mmsi in chronology")
+    //    mmsiDF.show(500, truncate = false)
+
+    // Create empty DataFrame for the answer (series of continuous events with the same Navigation Code)
+    val seriesDFColumns = Seq("mmsi", "lastTimestamp", columnName, additionalColumnName, "leadTime", "seriesLength")
+    var seriesDF: DataFrame = Seq
+      .empty[(Long, Long, Long, String, Long, Long)]
+      .toDF(seriesDFColumns: _*)
+
+    // set initial values of iteration variables
+    var previousRow: Row = mmsiDF.head() //take the first row from the data frame
+    var seriesLength = 1
+    var firstSeriesTime: Long = previousRow.getAs("epochMillis")
+
+    for (row <- mmsiDF.collect().drop(1)) {
+      // continuous series
+      if (row.getAs("nestedColumn") == previousRow.getAs("nestedColumn") ||
+        row.getAs("nestedAdditionalColumn") == previousRow.getAs("nestedAdditionalColumn")) {
+        seriesLength += 1
+        previousRow = row
+      }
+      // interrupted by the next series
+      else {
+        val lastSeriesTime = previousRow.getAs("epochMillis").asInstanceOf[Long]
+        val leadTime = lastSeriesTime - firstSeriesTime
+        val column: Long = previousRow.getAs("nestedColumn")
+        val additionalColumn: String = previousRow.getAs("nestedAdditionalColumn")
+        val seriesRow = Seq((mmsi, lastSeriesTime, column, additionalColumn, leadTime, seriesLength))
+          .toDF(seriesDFColumns: _*)
+        seriesDF = seriesDF.union(seriesRow) // add row with info about series to the result data frame
+
+        // reset iteration variables
+        seriesLength = 1
+        firstSeriesTime = row.getAs("epochMillis")
+        previousRow = row
+      }
+    }
+    // add unfinished series (last series that was not interrupted)
+    val lastSeriesTime = previousRow.getAs("epochMillis").asInstanceOf[Long]
+    val leadTime = lastSeriesTime - firstSeriesTime
+    val column: Long = previousRow.getAs("nestedColumn")
+    val additionalColumn: String = previousRow.getAs("nestedAdditionalColumn")
+    val seriesRow = Seq((mmsi, lastSeriesTime, column, additionalColumn, leadTime, seriesLength))
+      .toDF(seriesDFColumns: _*)
+    seriesDF = seriesDF.union(seriesRow)
+
+    seriesDF
   }
 
 }
